@@ -359,3 +359,75 @@ outputs.tfを直しても「Reference to undeclared resource」というエラ�
 - NAT Gatewayの「外からは入れないが、自分からは出られる」という一方通行の仕組みを、`ping`コマンドで体感的に理解できた
 - Terraformでコードを変更した際は、**ファイルの保存漏れ・反映漏れがないか常に確認する**という実務的な注意点を学んだ
 - 学習用のNAT Gatewayは課金対象になるため、確認後は速やかに`terraform destroy`する習慣が身についた
+
+
+---
+
+# 学習記録:2026年7月29日(水)
+## GitHub Actions × Terraform:CI/CDと「状態管理」の壁にぶつかった一日
+
+## やったこと
+- GitHub Actionsを使い、pushをきっかけにTerraformを自動実行する仕組み(CI/CD)に挑戦
+- IAMユーザー・アクセスキー・GitHub Secretsを使った認証設定
+- Terraform/AWS Providerのバージョン不整合の解決
+- S3をバックエンドとした tfstate の共有管理を実装
+
+## 🔴 つまずいたポイント(今回は特に多かった)
+
+### ① AuthFailure:認証情報が無効
+GitHub Actions上でterraform applyを実行したところ、以下のエラーが発生。
+
+**原因**: GitHub Secretsに登録したアクセスキーの情報に問題があった。
+**やってしまったこと**: 原因切り分けの過程で、誤ってIAMユーザー自体を削除してしまった。
+**解決**: 新しいIAMユーザーを作成し、アクセスキーを再発行。AdministratorAccessを付与し、aws configureとGitHub Secretsの両方を新しい値で更新。
+
+### ② No valid credential sources found
+Secretsを更新しても認証が通らず、調査したところGitHub Secretsの登録名が
+`AWS_ACCESS_KEY`(本来は`AWS_ACCESS_KEY_ID`)になっており、
+ワークフローファイルが参照している名前と一致していなかった。
+**解決**: Secretsの名前を正確に`AWS_ACCESS_KEY_ID`に登録し直して解決。
+
+### ③ InvalidHttpRequest: Unable to parse request
+認証は通ったが、Security GroupやSubnet作成時にこのエラーが頻発。
+**原因の仮説**: ローカル(Windows, Terraform v1.15.8, AWS Provider v6.55.0)と
+GitHub Actions(Ubuntu環境)でのバージョン不一致、
+またはAWS Provider v6系の新しい仕様(リソース単位のregion指定など)が影響している可能性。
+**結果**: 今回は根本原因の完全特定には至らず、ローカルでの検証に切り替えて対応。
+→ 今後の課題として持ち越し。
+
+### ④ VpcLimitExceeded / AddressLimitExceeded
+何度も試行錯誤する中で、削除し忘れたVPCやElastic IPが溜まり、
+AWSアカウントのリソース上限に達してエラーが発生。
+**解決**: AWSコンソールから、EC2→NAT Gateway→Elastic IP→VPCの順で手動削除。
+Elastic IPは関連付け解除直後は解放できないことがあり、少し時間を置く必要があった。
+
+### ⑤ 【今日一番の学び】destroyしても何も消えない問題
+GitHub Actions上でapply→destroyを試したところ、
+applyでは確かにAWS上にリソースが作られるのに、
+destroyを実行すると「Resources: 0 destroyed」となり、実際には何も消えなかった。
+
+**原因**: GitHub Actionsは、実行のたびに使い捨ての仮想環境を新しく用意する仕組みのため、
+tfstate(何を作ったかの記録)をローカルのファイルとして管理していると、
+実行が終わるたびにtfstateごと消滅してしまう。
+そのため、「apply時の記録」と「destroy時に参照する記録」が別物になり、
+destroyしても何も認識できない状態になっていた。
+
+**解決**: S3バケットを作成し、main.tfに`backend "s3"`を設定。
+tfstateを「どの実行環境からでも参照できる共有の場所」に置くことで解決。
+ローカルから`terraform apply`→`terraform destroy`を実行したところ、
+「Destroy complete! Resources: 14 destroyed.」と、正しく全リソースが削除されることを確認できた。
+
+## 今日の一番の理解
+
+
+## 学び
+- CI/CDパイプラインを組む際、認証情報(Secrets)の名前は1文字のズレも許されないため、正確な突き合わせ確認が重要
+- Terraform/Providerのバージョンは、ローカルとCI環境で必ず揃えるべき
+- AWSリソースには上限があり、検証中の消し忘れが積み重なると新規作成もできなくなる
+- **tfstateの管理場所(ローカル/リモート)という概念は、チーム開発やCI/CDの基本前提であり、今回身をもって理解できた**
+- 原因が特定しきれない問題(InvalidHttpRequestエラー)に直面した際、深追いせず「確実に検証できる方法(ローカル実行)」に切り替える判断も、実務で必要な選択肢の一つだと学んだ
+
+## 今後の課題
+- GitHub Actions上でのInvalidHttpRequestエラーの根本原因の特定
+- GitHub Actions用に、tfstateをロックする仕組み(DynamoDBなど)も学ぶと、より実務に近い構成になる
+- CI用ワークフローの自動apply(push時実行)は事故のもとになるため、pull_requestや手動実行(workflow_dispatch)を基本とする設計に変更済み

@@ -310,3 +310,52 @@ git config --global core.editor "notepad"
 - ALB(ロードバランサー)によるEC2複数台構成(冗長化)
 - Terraformのstate管理(tfstateの仕組みをより深く理解する)
 - 今回のような「巨大ファイルを誤ってコミットしてしまった場合」の、履歴を壊さずに修正する方法(BFG Repo-Cleaner等)の学習
+
+
+---
+---
+
+# 学習記録:2026年7月29日(水)
+## パブリック/プライベートサブネット & NAT Gateway構成への挑戦
+
+## やったこと
+- VPCをパブリックサブネットとプライベートサブネットの2階層に分離
+- NAT Gatewayを構築し、プライベートサブネットから外部への一方通行の通信を実現
+- 踏み台サーバー(bastion)を経由してのみプライベートサーバーにSSH接続できる構成を実装
+- セキュリティグループで「publicからのSSHのみ許可」という設定を実装
+
+## 構築した内容
+- VPC(nat-practice-vpc)
+- パブリックサブネット / プライベートサブネット
+- インターネットゲートウェイ / NAT Gateway / Elastic IP
+- パブリック用/プライベート用のルートテーブル
+- パブリック用/プライベート用のセキュリティグループ
+- 踏み台サーバー(public-bastion-server) / アプリサーバー(private-app-server)
+
+## 🔴 つまずいたポイント
+
+### ① terraform applyでyesが打てない
+PowerShellで実行していたところ、確認画面(Do you want to perform these actions?)の後、入力ができない状態になった。
+**解決**: コマンドプロンプト(cmd)に切り替えたところ解決。PowerShellとcmdで対話的な入力の挙動に差があることを確認。
+
+### ② outputs.tfが古い構成のままでエラー
+新しいmain.tf(public_server, private_server)に切り替えたが、outputs.tfが古いリソース名(aws_instance.web)を参照したままだったため、以下のエラーが発生。
+
+**解決**: outputs.tfの中身を新しいリソース名(public_server, private_server)に合わせて書き換え。
+
+### ③ main.tfが実は反映されていなかった
+outputs.tfを直しても「Reference to undeclared resource」というエラーが発生。
+原因は、実際のmain.tfがまだ古い構成(aws_instance.web)のままで、新しい構成の内容が保存されていなかったこと。
+**解決**: main.tfの中身を新しい構成の内容に書き換えて保存し直し、terraform planで再確認してから apply。
+
+## 動作確認でできたこと
+- 踏み台サーバーへのSSH接続
+- プライベートサーバーへの直接SSH接続が「できない」ことを確認(セキュリティの効果を実感)
+- 踏み台経由(`ssh -A`によるエージェント転送)でのプライベートサーバーへの接続に成功
+- プライベートサーバー内から`ping google.com`を実行し、NAT Gateway経由で外部通信ができることを確認
+
+## 学び
+- パブリック/プライベートサブネットの分離という、実務で標準的なセキュリティ設計を実際に構築できた
+- NAT Gatewayの「外からは入れないが、自分からは出られる」という一方通行の仕組みを、`ping`コマンドで体感的に理解できた
+- Terraformでコードを変更した際は、**ファイルの保存漏れ・反映漏れがないか常に確認する**という実務的な注意点を学んだ
+- 学習用のNAT Gatewayは課金対象になるため、確認後は速やかに`terraform destroy`する習慣が身についた

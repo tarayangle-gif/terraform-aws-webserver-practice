@@ -171,4 +171,4 @@ resource "aws_instance" "private_server" {
   tags = {
     Name = "private-app-server"
   }
-}
+}# CI test commit 

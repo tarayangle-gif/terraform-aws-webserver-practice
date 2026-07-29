@@ -431,3 +431,156 @@ tfstateを「どの実行環境からでも参照できる共有の場所」に�
 - GitHub Actions上でのInvalidHttpRequestエラーの根本原因の特定
 - GitHub Actions用に、tfstateをロックする仕組み(DynamoDBなど)も学ぶと、より実務に近い構成になる
 - CI用ワークフローの自動apply(push時実行)は事故のもとになるため、pull_requestや手動実行(workflow_dispatch)を基本とする設計に変更済み
+
+本日の追加分
+
+# Terraform × GitHub Actions による AWS 完全自動構築（CI/CD）パイプライン
+
+GitHub へのコード送信（`git push`）をトリガーとし、クラウド上の Runner（ロボット）が自動でテストから AWS 上への本番リソース構築までを行う **継続的デプロイ（CD: Continuous Deployment）パイプライン** です。
+
+手元のローカル端末に依存せず、クラウド環境で一貫したプロビジョニングを実行できる高度なインフラ開発環境を構築しました。
+
+---
+
+## 🎯 プロジェクトの目的と概要
+
+* **従来の課題**: 手元の端末から手動で `terraform apply` を実行する場合、実行環境の差異、ローカル鍵の取り扱いミス、手動操作によるオペレーションミスなどのリスクが存在する。
+* **解決策**: GitHub Actions による CI/CD パイプラインを導入。コード差分が発生した時点で自動でシミュレーション（Plan）を行い、問題がなければ自動で本番環境へ反映（Apply）させる「完全自動化」を実現。
+
+---
+
+## 🏗️ 構築した AWS インフラ構造 (Total: 14 リソース)
+
+Terraform コード（`main.tf`）により、以下の AWS ネットワークおよびコンピュート環境が全自動でプロビジョニングされます。
+
+* **Network**: 
+  * VPC（仮想ネットワーク空間の切り出し）
+  * Public Subnet（Web サーバー配置用サブネット）
+  * Internet Gateway（外部インターネット通信の有効化）
+  * Route Table / Route Table Association（ルーティング情報の管理と紐付け）
+* **Compute / Security**:
+  * EC2 Instance（Linux Web サーバー）
+  * Elastic IP (EIP)（サーバーへの固定パブリックIP付与）
+  * Security Group（HTTP 80 / SSH 22 ポートの通信制御）
+
+---
+
+## 🔄 CI/CD パイプラインのアーキテクチャ & ワークフロー
+
+```text
+[ ローカル PC ]
+    │  1. git push (main / master ブランチ)
+    ▼
+[ GitHub Repository ]
+    │  2. GitHub Actions ワークフローが自動検知・起動
+    ▼
+[ Runner: ubuntu-latest (使い捨て仮想マシン) ]
+    │
+    ├─ 3. Checkout
+    │      リポジトリの最新ソースコードを取得
+    │
+    ├─ 4. Setup Terraform
+    │      Terraform CLI 環境をセットアップ
+    │
+    ├─ 5. Terraform Init
+    │      AWS プロバイダープラグインの初期化
+    │
+    ├─ 6. Terraform Plan  【CI 段階】
+    │      既存の構文チェックおよび変更差分のシミュレーション
+    │
+    └─ 7. Terraform Apply (-auto-approve)  【CD 段階】
+           AWS へのリクエストを自動発行し、全リソースを作成
+```
+
+---
+
+## 🛠️ 導入した技術スタック (Tech Stack)
+
+| カテゴリ | 技術・サービス | 用途・詳細 |
+| :--- | :--- | :--- |
+| **IaC** | Terraform (v1.x) | AWS リソースのコードによる宣言的定義 |
+| **CI/CD** | GitHub Actions | 自動テスト・自動デプロイワークフローの実行環境 |
+| **Cloud** | AWS (Amazon Web Services) | VPC, EC2, SG, EIP などの本番インフラ |
+| **Region** | Asia Pacific (Tokyo: `ap-northeast-1`) | 低遅延・日本国内向けのリージョン指定 |
+| **Secret Auth** | GitHub Actions Secrets | AWS アクセスキー情報の安全な秘匿化 |
+
+---
+
+## 💡 トラブルシューティング & 実装上の学び (Learnings)
+
+本パイプラインの構築過程において、実務で頻出するいくつかの技術的課題を特定し、解決しました。
+
+### 1. 認証情報のスコープ漏れによる `AuthFailure (401)` の解決
+* **問題**: `terraform plan` までは正常終了するが、`terraform apply` ステップで `No valid credential sources found` および `StatusCode 401` エラーが発生。
+* **原因**: GitHub Actions の各ステップ（`step`）は完全に独立した環境で動くため、`apply` ステップに対して `env:`（環境変数）が伝播していなかった。
+* **解決**: `Terraform Apply` ステップにも明確に `AWS_ACCESS_KEY_ID` と `AWS_SECRET_ACCESS_KEY` を割り当てることで認証をパスさせました。
+
+### 2. YAML 構文エラー（インデント不整合）の解消
+* **問題**: ワークフロー実行時に `Invalid workflow file (yaml syntax error)` が発生。
+* **原因**: `- name: Terraform Apply` の先頭スペース数が他のステップとズレており、YAML インデント階層構造が破損していた。
+* **解決**: インデント（半角スペース2文字単位）を全ステップで厳密に統一し、文法エラーを解消。
+
+### 3. CI/CD 環境における非対話型実行 (`-auto-approve`)
+* **問題**: 通常の `terraform apply` はターミナルで `yes` の対話入力が必要なため、CI/CD ロボットが停止してしまう。
+* **解決**: `-auto-approve` オプションを付与し、確認ステップを自動スキップさせることで全自動デプロイを実現。
+
+---
+
+## 📄 最終的なワークフロー定義コード (`.github/workflows/terraform.yml`)
+
+```yaml
+name: 'Terraform CI/CD Pipeline'
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+permissions:
+  contents: read
+
+jobs:
+  terraform:
+    name: 'Terraform Automate'
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+
+    - name: Terraform Init
+      run: terraform init
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        AWS_REGION: 'ap-northeast-1'
+
+    - name: Terraform Plan
+      run: terraform plan
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        AWS_REGION: 'ap-northeast-1'
+
+    - name: Terraform Apply
+      run: terraform apply -auto-approve
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        AWS_REGION: 'ap-northeast-1'
+```
+
+---
+
+## 🚀 今後の拡張・改善予定 (Next Steps)
+
+* [ ] **tfstate（状態管理）のリモート化**
+  S3 バケットおよび DynamoDB（排他ロック用）へ `terraform.tfstate` を保存し、チーム開発およびステート保持に対応させる。
+* [ ] **Manual Approval（手動承認ゲート）の導入**
+  本番（Production）デプロイ前に、GitHub 上でエンジニアの明示的な「承認ボタン」を必要とするセキュリティ設計への強化。
+* [ ] **自動削除（Destroy）ワークフローの追加**
+  検証用環境の削除コストを削減するため、手動実行可能な `terraform destroy` ワークフローの構築。
